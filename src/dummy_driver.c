@@ -17,6 +17,12 @@
 /* All drivers using the mi colormap manipulation need this */
 #include "micmap.h"
 
+#ifdef RANDR
+#include "randrstr.h"
+#endif
+
+#include "windowstr.h"
+
 /* identifying atom needed by magnifiers */
 #include <X11/Xatom.h>
 #include "property.h"
@@ -48,6 +54,9 @@
 #define _XF86DGA_SERVER_
 #include <X11/extensions/xf86dgaproto.h>
 #endif
+
+/* Needed for fixing pointer limits on resize */
+#include "inputstr.h"
 
 /* Mandatory functions */
 static const OptionInfoRec *	DUMMYAvailableOptions(int chipid, int busid);
@@ -115,11 +124,15 @@ static SymTabRec DUMMYChipsets[] = {
 };
 
 typedef enum {
-    OPTION_SW_CURSOR
+    OPTION_SW_CURSOR,
+    OPTION_CONSTANT_DPI
 } DUMMYOpts;
 
 static const OptionInfoRec DUMMYOptions[] = {
     { OPTION_SW_CURSOR,	"SWcursor",	OPTV_BOOLEAN,	{0}, FALSE },
+#ifdef RANDR
+    { OPTION_CONSTANT_DPI,	"ConstantDPI",	OPTV_BOOLEAN,	{0}, FALSE },
+#endif
     { -1,                  NULL,           OPTV_NONE,	{0}, FALSE }
 };
 
@@ -307,6 +320,7 @@ DUMMYPreInit(ScrnInfoPtr pScrn, int flags)
 	case 15:
 	case 16:
 	case 24:
+        case 30:
 	    break;
 	default:
 	    xf86DrvMsg(pScrn->scrnIndex, X_ERROR,
@@ -321,8 +335,8 @@ DUMMYPreInit(ScrnInfoPtr pScrn, int flags)
 	pScrn->rgbBits = 8;
 
     /* Get the depth24 pixmap format */
-    if (pScrn->depth == 24 && pix24bpp == 0)
-	pix24bpp = xf86GetBppFromDepth(pScrn, 24);
+    if (pScrn->depth >= 24 && pix24bpp == 0)
+	pix24bpp = xf86GetBppFromDepth(pScrn, pScrn->depth);
 
     /*
      * This must happen after pScrn->display has been set because
@@ -359,6 +373,7 @@ DUMMYPreInit(ScrnInfoPtr pScrn, int flags)
     xf86ProcessOptions(pScrn->scrnIndex, pScrn->options, dPtr->Options);
 
     xf86GetOptValBool(dPtr->Options, OPTION_SW_CURSOR,&dPtr->swCursor);
+    xf86GetOptValBool(dPtr->Options, OPTION_CONSTANT_DPI, &dPtr->constantDPI);
 
     if (device->videoRam != 0) {
 	pScrn->videoRam = device->videoRam;
@@ -612,7 +627,7 @@ DUMMYScreenInit(SCREEN_INIT_ARGS_DECL)
     if(!miCreateDefColormap(pScreen))
 	return FALSE;
 
-    if (!xf86HandleColormaps(pScreen, 256, pScrn->rgbBits,
+    if (!xf86HandleColormaps(pScreen, 1024, pScrn->rgbBits,
                          DUMMYLoadPalette, NULL, 
                          CMAP_PALETTED_TRUECOLOR 
 			     | CMAP_RELOAD_ON_MODE_SWITCH))
@@ -639,10 +654,65 @@ DUMMYScreenInit(SCREEN_INIT_ARGS_DECL)
     return TRUE;
 }
 
+const char *XDPY_PROPERTY = "dummy-constant-xdpi";
+const char *YDPY_PROPERTY = "dummy-constant-ydpi";
+static int get_dpi_value(WindowPtr root, const char *property_name, int default_dpi)
+{
+    PropertyPtr prop;
+    Atom type_atom = MakeAtom("CARDINAL", 8, TRUE);
+    Atom prop_atom = MakeAtom(property_name, strlen(property_name), FALSE);
+
+    for (prop = wUserProps(root); prop; prop = prop->next) {
+       if (prop->propertyName == prop_atom && prop->type == type_atom && prop->data) {
+           int v = (int) (*((CARD32 *) prop->data));
+           if ((v>0) && (v<4096)) {
+               xf86DrvMsg(0, X_INFO, "get_constant_dpi_value() found property \"%s\" with value=%i\n", property_name, (int) v);
+               return (int) v;
+           }
+           break;
+       }
+    }
+    return default_dpi;
+}
+
 /* Mandatory */
 Bool
 DUMMYSwitchMode(SWITCH_MODE_ARGS_DECL)
 {
+    SCRN_INFO_PTR(arg);
+#ifdef RANDR
+    DUMMYPtr dPtr = DUMMYPTR(pScrn);
+    if (dPtr->constantDPI) {
+        int xDpi = get_dpi_value(pScrn->pScreen->root, XDPY_PROPERTY, pScrn->xDpi);
+        int yDpi = get_dpi_value(pScrn->pScreen->root, YDPY_PROPERTY, pScrn->yDpi);
+        //25.4 mm per inch: (254/10)
+        pScrn->pScreen->mmWidth = mode->HDisplay * 254 / xDpi / 10;
+        pScrn->pScreen->mmHeight = mode->VDisplay * 254 / yDpi / 10;
+        xf86DrvMsg(pScrn->scrnIndex, X_INFO, "mm(dpi %ix%i)=%ix%i\n", xDpi, yDpi, pScrn->pScreen->mmWidth, pScrn->pScreen->mmHeight);
+        RRScreenSizeNotify(pScrn->pScreen);
+        RRTellChanged(pScrn->pScreen);
+    }
+#endif
+    //ensure the screen dimensions are also updated:
+    pScrn->pScreen->width = mode->HDisplay;
+    pScrn->pScreen->height = mode->VDisplay;
+    pScrn->virtualX = mode->HDisplay;
+    pScrn->virtualY = mode->VDisplay;
+    pScrn->frameX1 = mode->HDisplay;
+    pScrn->frameY1 = mode->VDisplay;
+
+    //ensure the pointer uses the new limits too:
+    DeviceIntPtr pDev;
+    SpritePtr pSprite;
+    for (pDev = inputInfo.devices; pDev; pDev = pDev->next) {
+        if (pDev->spriteInfo!=NULL && pDev->spriteInfo->sprite!=NULL) {
+            pSprite = pDev->spriteInfo->sprite;
+            pSprite->hotLimits.x2 = mode->HDisplay;
+            pSprite->hotLimits.y2 = mode->VDisplay;
+            pSprite->physLimits.x2 = mode->HDisplay;
+            pSprite->physLimits.y2 = mode->VDisplay;
+        }
+    }
     return TRUE;
 }
 

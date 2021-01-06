@@ -51,6 +51,7 @@ typedef struct dummyRec
     /* options */
     OptionInfoPtr Options;
     Bool swCursor;
+    Bool constantDPI;
     /* proc pointer */
     CloseScreenProcPtr CloseScreen;
     xf86CursorInfoPtr CursorInfo;
@@ -68,7 +69,7 @@ typedef struct dummyRec
     int overlay_offset;
     int videoKey;
     int interlace;
-    dummy_colors colors[256];
+    dummy_colors colors[1024];
     pointer* FBBase;
     Bool        (*CreateWindow)() ;     /* wrapped CreateWindow */
     Bool prop;
